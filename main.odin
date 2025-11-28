@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:math"
 import "core:slice"
 import "core:strings"
 import rl "vendor:raylib"
@@ -13,6 +14,7 @@ State :: struct
     worldHeight:     int,
     simulationSpeed: int,
     showActiveCells: bool,
+    showCameraDebug: bool,
     world:           WorldState,
 }
 
@@ -34,6 +36,7 @@ GuiState :: struct
     simSpeed:                  i32,
     cellSize:                  i32,
     showActiveCells:           bool,
+    showCameraDebug:           bool,
     world:                     ^WorldState,
 }
 
@@ -72,6 +75,7 @@ init :: proc(width, height, cellSize, simSpeed: int)
         width,
         height,
         simSpeed,
+        false,
         false,
         {cellsOld = b, cellsNew = f},
     }
@@ -315,6 +319,11 @@ showSettingsPanel :: proc(guiState: ^GuiState) -> bool
         "Show active region",
         &guiState.showActiveCells,
     )
+    rl.GuiCheckBox(
+        {menuOriginX, menuOriginY + row * 6, row, row},
+        "Show camera debug",
+        &guiState.showCameraDebug,
+    )
 
     if (rl.GuiButton(
                {menuOriginX, menuOriginY + row * rowCount, menuWidth, row},
@@ -325,6 +334,7 @@ showSettingsPanel :: proc(guiState: ^GuiState) -> bool
         state.simulationSpeed = int(guiState.simSpeed)
         state.cellSize = int(guiState.cellSize)
         state.showActiveCells = guiState.showActiveCells
+        state.showCameraDebug = guiState.showCameraDebug
 
         resizeWorld(int(guiState.cellSize))
 
@@ -333,6 +343,25 @@ showSettingsPanel :: proc(guiState: ^GuiState) -> bool
     }
 
     return true
+}
+
+// clamp camera such that the outside of the world is not shown
+clampCamera :: proc(worldDimensions: Vec2f, camera: ^rl.Camera2D)
+{
+    // view width in world space units
+    viewWidth := f32(worldDimensions.x) / camera.zoom
+    viewHeight := f32(worldDimensions.y) / camera.zoom
+
+    camera.target.x = clamp(
+        camera.target.x,
+        (viewWidth / 2),
+        f32(worldDimensions.x) - (viewWidth / 2),
+    )
+    camera.target.y = clamp(
+        camera.target.y,
+        viewHeight / 2,
+        f32(worldDimensions.y) - (viewHeight / 2),
+    )
 }
 
 main :: proc()
@@ -347,6 +376,8 @@ main :: proc()
     // init state
     init(WINDOW_WIDTH, WINDOW_HEIGHT, DEFAULT_CELL_SIZE, DEFAULT_SIM_SPEED)
 
+    // TODO: clean this up?
+
     // copy current state
     guiState := GuiState {
         WINDOW_WIDTH,
@@ -354,6 +385,7 @@ main :: proc()
         i32(state.simulationSpeed),
         i32(state.cellSize),
         state.showActiveCells,
+        state.showCameraDebug,
         &state.world,
     }
 
@@ -362,24 +394,45 @@ main :: proc()
     paused := false
     showSettings := false
 
-    lastUpdated := rl.GetTime()
     accumulator: f32
+
+    screenMiddle := rl.Vector2{WINDOW_WIDTH, WINDOW_HEIGHT} / 2
+    camera := rl.Camera2D{screenMiddle, screenMiddle, 0, 1}
 
     for !rl.WindowShouldClose()
     {
         dt := rl.GetFrameTime()
 
         // input
+        //TODO: create state machine or clean up code some other way
+
         //TODO: duplicated
-        if rl.IsMouseButtonDown(.LEFT) && !showSettings
+        if rl.IsMouseButtonDown(.LEFT) &&
+           !showSettings &&
+           !rl.IsKeyDown(.LEFT_SHIFT)
         {
             mousePos := rl.GetMousePosition()
+            mouseWorldPos := rl.GetScreenToWorld2D(mousePos, camera)
             mouseGridPos :=
-                Vec2i{int(mousePos.x), int(mousePos.y)} / state.cellSize
+                Vec2i{int(mouseWorldPos.x), int(mouseWorldPos.y)} /
+                state.cellSize
             if isInside(mouseGridPos)
             {
                 changeCell(mouseGridPos, .alive)
             }
+
+        }
+
+        if rl.IsMouseButtonDown(.LEFT) && rl.IsKeyDown(.LEFT_SHIFT)
+        {
+
+            delta := rl.GetMouseDelta() * (-1.0 / camera.zoom)
+            camera.target += delta
+
+            clampCamera(
+                {f32(state.worldWidth), f32(state.worldHeight)},
+                &camera,
+            )
         }
 
         if rl.IsMouseButtonDown(.RIGHT) && !showSettings
@@ -406,6 +459,8 @@ main :: proc()
 
         if rl.IsKeyPressed(.R)
         {
+            // TODO: fix this
+
             // reset world
             slice.zero(state.world.cellsOld)
             slice.zero(state.world.cellsNew)
@@ -416,10 +471,43 @@ main :: proc()
             generation = 0
         }
 
+        // step simulation 1 at a time
         if rl.IsKeyPressed(.PERIOD) && paused
         {
             updateSim()
         }
+
+        wheel := rl.GetMouseWheelMove()
+        if wheel != 0
+        {
+            mousePos := rl.GetMousePosition()
+            // world position under mouse BEFORE zoom change
+            mouseWorldBefore := rl.GetScreenToWorld2D(mousePos, camera)
+
+            // compute new zoom
+            //TODO: fix zoom for large world sizes
+            scale := 0.2 * wheel
+            zm := math.exp(math.log(camera.zoom, 3) + scale)
+            newZoom := clamp(zm, 1.0, 64.0)
+
+            // update zoom
+            camera.zoom = newZoom
+
+            // recompute target so mouseWorldBefore stays anchored under the mouse
+            camera.target.x =
+                mouseWorldBefore.x -
+                (mousePos.x - camera.offset.x) / camera.zoom
+            camera.target.y =
+                mouseWorldBefore.y -
+                (mousePos.y - camera.offset.y) / camera.zoom
+
+            // clamp target to world bounds (use world size, not window size)
+            clampCamera(
+                {f32(state.worldWidth), f32(state.worldHeight)},
+                &camera,
+            )
+        }
+
 
         if !paused do accumulator += dt
         // update
@@ -432,10 +520,23 @@ main :: proc()
             generation += 1
         }
 
-
         // draw
         rl.BeginDrawing()
         rl.ClearBackground(rl.BLACK)
+
+        rl.BeginMode2D(camera)
+
+        if state.showCameraDebug
+        {
+            rl.DrawRectangleV({0, 0}, {1280, 720}, rl.DARKBLUE)
+            rl.DrawCircleV(camera.target, 10, rl.RED)
+            rl.DrawCircleV(
+                ((Vec2f{1280, 720} / 2) - camera.offset) / camera.zoom +
+                camera.target,
+                10,
+                rl.BLUE,
+            )
+        }
 
         // TODO: store the alive cells so that we dont have to loop through all cells
         // would also allow us to remove the second loop to draw the cell changes
@@ -480,6 +581,7 @@ main :: proc()
             }
         }
 
+        rl.EndMode2D()
 
         fps := 1 / dt
         rl.DrawText(
