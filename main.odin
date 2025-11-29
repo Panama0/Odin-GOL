@@ -21,13 +21,14 @@ State :: struct
 // state for the cells
 WorldState :: struct
 {
-    cellsOld:    []CellState,
-    cellsNew:    []CellState,
-    aliveCells:  int,
-    activeNew:   map[int]struct{},
-    activeOld:   map[int]struct{},
+    cellsOld:       []CellState,
+    cellsNew:       []CellState,
+    aliveCellCount: int,
+    activeNew:      map[int]struct{},
+    activeOld:      map[int]struct{},
     // map of index to change to make
-    cellChanges: map[int]CellState,
+    cellChanges:    map[int]CellState,
+    aliveCells:     map[int]struct{},
 }
 
 GuiState :: struct
@@ -99,44 +100,33 @@ resizeWorld :: proc(cellSize: int)
 
     state.world.cellsNew = f
     state.world.cellsOld = b
-    state.world.aliveCells = 0
+    state.world.aliveCellCount = 0
 }
 
-changeCell :: proc(cell: Vec2i, to: CellState)
+editCell :: proc(cell: Vec2i, to: CellState)
 {
     cellIdx := cellToIdx(cell)
-    cellToChange := state.world.cellsOld[cellIdx]
 
-    // if the change does anything
-    if cellIdx not_in state.world.cellChanges && to != cellToChange
+    // only add the change if it is not duplicated
+    if cellIdx not_in state.world.cellChanges ||
+       state.world.cellChanges[cellIdx] != to
     {
         state.world.cellChanges[cellIdx] = to
 
         switch to
         {
         case .alive:
-            state.world.aliveCells += 1
+            state.world.aliveCellCount += 1
+            state.world.aliveCells[cellIdx] = {}
         case .dead:
-            state.world.aliveCells -= 1
+            state.world.aliveCellCount -= 1
+            delete_key(&state.world.aliveCells, cellIdx)
         }
+
     }
 }
 
-//TODO: remove this?
-getCellState :: proc(cell: Vec2i) -> CellState
-{
-    if !isInside(cell)
-    {
-        return .dead
-    }
-     else
-    {
-        return state.world.cellsOld[cellToIdx(cell)]
-    }
-}
-
-// Coversion funcitons
-//TODO: make these take the values they need for the calculation instead of using global state?
+// Conversion Functions
 
 cellToWorld :: proc(cell: Vec2i) -> Vec2f
 {
@@ -168,24 +158,38 @@ isInside :: proc(cell: Vec2i) -> bool
     return true
 }
 
-getNewCellState :: proc(current: CellState, neighbours: int) -> CellState
+simulateCell :: proc(
+    current: CellState,
+    cellIndex: int,
+    neighbours: int,
+) -> CellState
 {
     if current == .alive
     {
         if neighbours == 2 || neighbours == 3
         {
+            // lives on
             return .alive
         }
-        state.world.aliveCells -= 1
+        // dies
+        state.world.aliveCellCount -= 1
+
+        delete_key(&state.world.aliveCells, cellIndex)
+
         return .dead
     }
      else
     {     // current == .dead
         if neighbours == 3
         {
-            state.world.aliveCells += 1
+            // reproduces
+            state.world.aliveCellCount += 1
+
+            state.world.aliveCells[cellIndex] = {}
+
             return .alive
         }
+        // continues to be dead
         return .dead
     }
 }
@@ -193,6 +197,10 @@ getNewCellState :: proc(current: CellState, neighbours: int) -> CellState
 updateSim :: proc()
 {
     world := &state.world
+    // swap buffers
+    world.cellsOld, world.cellsNew = world.cellsNew, world.cellsOld
+
+    world.activeNew, world.activeOld = world.activeOld, world.activeNew
 
     // apply changes made by user
     //TODO: deletions are not working correctly
@@ -211,6 +219,7 @@ updateSim :: proc()
 
         // write in changes
         world.cellsOld[key] = value
+
     }
 
     clear(&world.cellChanges)
@@ -227,13 +236,14 @@ updateSim :: proc()
         neighbours: int
         for d in DirectionVectors
         {
-            if getCellState(currentCell + d) == .alive
+            if isInside(currentCell) &&
+               world.cellsOld[cellToIdx(currentCell + d)] == .alive
             {
                 neighbours += 1
             }
         }
 
-        world.cellsNew[i] = getNewCellState(cellState, neighbours)
+        world.cellsNew[i] = simulateCell(cellState, i, neighbours)
 
         // if the cell changed, add it and its neighbours to the active cells list
         if world.cellsNew[i] != world.cellsOld[i]
@@ -251,11 +261,6 @@ updateSim :: proc()
         }
 
     }
-
-    // swap buffers
-    world.cellsOld, world.cellsNew = world.cellsNew, world.cellsOld
-
-    world.activeNew, world.activeOld = world.activeOld, world.activeNew
 }
 
 // returns false if closed by the user
@@ -366,6 +371,7 @@ clampCamera :: proc(worldDimensions: Vec2f, camera: ^rl.Camera2D)
 
 main :: proc()
 {
+
     WINDOW_WIDTH :: 1280
     WINDOW_HEIGHT :: 720
     DEFAULT_CELL_SIZE :: 10
@@ -399,113 +405,130 @@ main :: proc()
     screenMiddle := rl.Vector2{WINDOW_WIDTH, WINDOW_HEIGHT} / 2
     camera := rl.Camera2D{screenMiddle, screenMiddle, 0, 1}
 
+    InputModes :: enum
+    {
+        normalMode,
+        settingsMode,
+        cameraMode,
+    }
+
+    mode := InputModes{}
+
     for !rl.WindowShouldClose()
     {
         dt := rl.GetFrameTime()
 
         // input
-        //TODO: create state machine or clean up code some other way
 
-        //TODO: duplicated
-        if rl.IsMouseButtonDown(.LEFT) &&
-           !showSettings &&
-           !rl.IsKeyDown(.LEFT_SHIFT)
+        if rl.IsKeyDown(.LEFT_SHIFT)
         {
-            mousePos := rl.GetMousePosition()
-            mouseWorldPos := rl.GetScreenToWorld2D(mousePos, camera)
-            mouseGridPos :=
-                Vec2i{int(mouseWorldPos.x), int(mouseWorldPos.y)} /
-                state.cellSize
-            if isInside(mouseGridPos)
-            {
-                changeCell(mouseGridPos, .alive)
-            }
+            mode = .cameraMode
 
         }
-
-        if rl.IsMouseButtonDown(.LEFT) && rl.IsKeyDown(.LEFT_SHIFT)
+         else if rl.IsKeyPressed(.S)
         {
+            mode = .settingsMode
+        }
 
-            delta := rl.GetMouseDelta() * (-1.0 / camera.zoom)
-            camera.target += delta
-
-            clampCamera(
-                {f32(state.worldWidth), f32(state.worldHeight)},
-                &camera,
+        switch mode
+        {
+        case .normalMode:
+            handleClick :: proc(
+                camera: rl.Camera2D,
+                mousePos: rl.Vector2,
+                action: CellState,
             )
-        }
-
-        if rl.IsMouseButtonDown(.RIGHT) && !showSettings
-        {
-            mousePos := rl.GetMousePosition()
-            mouseGridPos :=
-                Vec2i{int(mousePos.x), int(mousePos.y)} / state.cellSize
-            if isInside(mouseGridPos)
             {
-                changeCell(mouseGridPos, .dead)
+                mouseWorldPos := rl.GetScreenToWorld2D(mousePos, camera)
+                mouseGridPos :=
+                    Vec2i{int(mouseWorldPos.x), int(mouseWorldPos.y)} /
+                    state.cellSize
+                if isInside(mouseGridPos)
+                {
+                    editCell(mouseGridPos, action)
+                }
+
             }
-        }
 
-        if rl.IsKeyPressed(.SPACE)
-        {
-            // toggle paused
-            paused = !paused
-        }
+            if rl.IsMouseButtonDown(.LEFT)
+            {
+                handleClick(camera, rl.GetMousePosition(), .alive)
+            }
 
-        if rl.IsKeyPressed(.S)
-        {
+            if rl.IsMouseButtonDown(.RIGHT)
+            {
+                handleClick(camera, rl.GetMousePosition(), .dead)
+            }
+
+            if wheel := rl.GetMouseWheelMove(); wheel != 0
+            {
+                mousePos := rl.GetMousePosition()
+                // world position under mouse BEFORE zoom change
+                mouseWorldBefore := rl.GetScreenToWorld2D(mousePos, camera)
+
+                // compute new zoom
+                scale := 0.2 * wheel
+                zm := math.exp(math.ln(camera.zoom) + scale)
+                camera.zoom = clamp(zm, 1.0, 64.0)
+
+                // recompute target so mouseWorldBefore stays anchored under the mouse
+                camera.target.x =
+                    mouseWorldBefore.x -
+                    (mousePos.x - camera.offset.x) / camera.zoom
+                camera.target.y =
+                    mouseWorldBefore.y -
+                    (mousePos.y - camera.offset.y) / camera.zoom
+
+                // clamp target to world bounds (use world size, not window size)
+                clampCamera(
+                    {f32(state.worldWidth), f32(state.worldHeight)},
+                    &camera,
+                )
+            }
+
+            if rl.IsKeyPressed(.SPACE)
+            {
+                paused = !paused
+            }
+
+
+            if rl.IsKeyPressed(.R)
+            {
+                // TODO: fix this
+
+                // reset world
+                slice.zero(state.world.cellsOld)
+                slice.zero(state.world.cellsNew)
+                clear(&state.world.activeNew)
+                clear(&state.world.activeOld)
+                state.world.aliveCellCount = 0
+                clear(&state.world.cellChanges)
+                clear(&state.world.aliveCells)
+                generation = 0
+            }
+
+            // step simulation 1 at a time
+            if rl.IsKeyPressed(.PERIOD) && paused
+            {
+                updateSim()
+            }
+        case .settingsMode:
             showSettings = true
-        }
+        case .cameraMode:
+            if rl.IsMouseButtonDown(.LEFT)
+            {
+                delta := rl.GetMouseDelta() * (-1.0 / camera.zoom)
+                camera.target += delta
 
-        if rl.IsKeyPressed(.R)
-        {
-            // TODO: fix this
-
-            // reset world
-            slice.zero(state.world.cellsOld)
-            slice.zero(state.world.cellsNew)
-            clear(&state.world.activeNew)
-            clear(&state.world.activeOld)
-            state.world.aliveCells = 0
-            clear(&state.world.cellChanges)
-            generation = 0
-        }
-
-        // step simulation 1 at a time
-        if rl.IsKeyPressed(.PERIOD) && paused
-        {
-            updateSim()
-        }
-
-        wheel := rl.GetMouseWheelMove()
-        if wheel != 0
-        {
-            mousePos := rl.GetMousePosition()
-            // world position under mouse BEFORE zoom change
-            mouseWorldBefore := rl.GetScreenToWorld2D(mousePos, camera)
-
-            // compute new zoom
-            //TODO: fix zoom for large world sizes
-            scale := 0.2 * wheel
-            zm := math.exp(math.log(camera.zoom, 3) + scale)
-            newZoom := clamp(zm, 1.0, 64.0)
-
-            // update zoom
-            camera.zoom = newZoom
-
-            // recompute target so mouseWorldBefore stays anchored under the mouse
-            camera.target.x =
-                mouseWorldBefore.x -
-                (mousePos.x - camera.offset.x) / camera.zoom
-            camera.target.y =
-                mouseWorldBefore.y -
-                (mousePos.y - camera.offset.y) / camera.zoom
-
-            // clamp target to world bounds (use world size, not window size)
-            clampCamera(
-                {f32(state.worldWidth), f32(state.worldHeight)},
-                &camera,
-            )
+                clampCamera(
+                    {f32(state.worldWidth), f32(state.worldHeight)},
+                    &camera,
+                )
+            }
+             else
+            {
+                mode = .normalMode
+            }
         }
 
 
@@ -528,57 +551,36 @@ main :: proc()
 
         if state.showCameraDebug
         {
-            rl.DrawRectangleV({0, 0}, {1280, 720}, rl.DARKBLUE)
+            worldDim := rl.Vector2 {
+                f32(state.worldWidth),
+                f32(state.worldHeight),
+            }
+            rl.DrawRectangleV({0, 0}, worldDim, rl.DARKBLUE)
             rl.DrawCircleV(camera.target, 10, rl.RED)
             rl.DrawCircleV(
-                ((Vec2f{1280, 720} / 2) - camera.offset) / camera.zoom +
-                camera.target,
+                ((worldDim / 2) - camera.offset) / camera.zoom + camera.target,
                 10,
                 rl.BLUE,
             )
         }
 
-        // TODO: store the alive cells so that we dont have to loop through all cells
-        // would also allow us to remove the second loop to draw the cell changes
-        for cell, i in state.world.cellsNew
+        for idx in state.world.aliveCells
         {
-            if cell == .alive
-            {
-                cellPos := cellToWorld(idxToCell(i))
-                size := rl.Vector2{f32(state.cellSize), f32(state.cellSize)}
-
-                rl.DrawRectangleV(cellPos, size, rl.WHITE)
-
-            }
-            // show active cells
-            if state.showActiveCells
-            {
-                if i in state.world.activeNew
-                {
-                    cellPos := cellToWorld(idxToCell(i))
-                    size := rl.Vector2 {
-                        f32(state.cellSize),
-                        f32(state.cellSize),
-                    }
-                    rl.DrawRectangleV(
-                        cellPos,
-                        size,
-                        rl.Color{0, 128, 128, 128},
-                    )
-                }
-
-            }
+            cellPos := cellToWorld(idxToCell(idx))
+            size := rl.Vector2{f32(state.cellSize), f32(state.cellSize)}
+            rl.DrawRectangleV(cellPos, size, rl.WHITE)
         }
 
-        //WARN: maybe temp
-        for key, value in state.world.cellChanges
+        // show active cells
+        if state.showActiveCells
         {
-            if value == .alive
+            for idx in state.world.activeNew
             {
-                cellPos := cellToWorld(idxToCell(key))
+                cellPos := cellToWorld(idxToCell(idx))
                 size := rl.Vector2{f32(state.cellSize), f32(state.cellSize)}
-                rl.DrawRectangleV(cellPos, size, rl.WHITE)
+                rl.DrawRectangleV(cellPos, size, rl.Color{0, 128, 128, 128})
             }
+
         }
 
         rl.EndMode2D()
@@ -588,7 +590,7 @@ main :: proc()
             strings.clone_to_cstring(
                 fmt.aprintf(
                     "Alive Cells: %v\nGeneration: %v\nFPS: %v",
-                    state.world.aliveCells,
+                    state.world.aliveCellCount,
                     generation,
                     fps,
                     allocator = context.temp_allocator,
@@ -606,7 +608,11 @@ main :: proc()
         {
             open := showSettingsPanel(&guiState)
 
-            if !open do showSettings = false
+            if !open
+            {
+                showSettings = false
+                mode = .normalMode
+            }
         }
 
         rl.EndDrawing()
