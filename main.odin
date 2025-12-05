@@ -1,7 +1,10 @@
 package main
 
+import "core:c"
 import "core:fmt"
 import "core:math"
+import "core:mem"
+import vmem "core:mem/virtual"
 import "core:slice"
 import "core:strings"
 import rl "vendor:raylib"
@@ -15,30 +18,20 @@ State :: struct
     simulationSpeed: int,
     showActiveCells: bool,
     showCameraDebug: bool,
-    world:           WorldState,
+    world:           World,
 }
 
 // state for the cells
-WorldState :: struct
+World :: struct
 {
-    cellsOld:       []CellState,
-    cellsNew:       []CellState,
-    aliveCellCount: int,
-    activeNew:      map[int]struct{},
-    activeOld:      map[int]struct{},
+    cellsOld:    []CellState,
+    cellsNew:    []CellState,
+    activeNew:   map[int]struct{},
+    activeOld:   map[int]struct{},
     // map of index to change to make
-    cellChanges:    map[int]CellState,
-    aliveCells:     map[int]struct{},
-}
-
-GuiState :: struct
-{
-    windowWidth, windowHeight: int,
-    simSpeed:                  i32,
-    cellSize:                  i32,
-    showActiveCells:           bool,
-    showCameraDebug:           bool,
-    world:                     ^WorldState,
+    cellChanges: map[int]CellState,
+    aliveCells:  map[int]struct{},
+    arena:       vmem.Arena,
 }
 
 Vec2i :: [2]int
@@ -65,11 +58,18 @@ state: State
 
 init :: proc(width, height, cellSize, simSpeed: int)
 {
+    arena: vmem.Arena
+    alloc := vmem.arena_allocator(&arena)
+
     cellCount := (width / cellSize) * (height / cellSize)
 
-    f := make([]CellState, cellCount)
-    b := make([]CellState, cellCount)
+    f := make([]CellState, cellCount, alloc)
+    b := make([]CellState, cellCount, alloc)
 
+    activeOld := make(map[int]struct{})
+    activeNew := make(map[int]struct{})
+    cellChanges := make(map[int]CellState)
+    aliveCells := make(map[int]struct{})
 
     state = State {
         cellSize,
@@ -78,29 +78,35 @@ init :: proc(width, height, cellSize, simSpeed: int)
         simSpeed,
         false,
         false,
-        {cellsOld = b, cellsNew = f},
+        World{f, b, activeOld, activeNew, cellChanges, aliveCells, arena},
     }
+}
+
+//TODO: this is bad and crashes after delete then clear
+deleteWorld :: proc()
+{
+    vmem.arena_destroy(&state.world.arena)
+    delete(state.world.activeOld)
+    delete(state.world.activeNew)
+    delete(state.world.cellChanges)
+    delete(state.world.aliveCells)
+}
+
+clearWorld :: proc()
+{
+    vmem.arena_free_all(&state.world.arena)
+    clear(&state.world.activeOld)
+    clear(&state.world.activeNew)
+    clear(&state.world.cellChanges)
+    clear(&state.world.aliveCells)
 }
 
 resizeWorld :: proc(cellSize: int)
 {
-    //TODO: fix this function
-    delete(state.world.cellsOld)
-    delete(state.world.cellsNew)
-
-    clear(&state.world.activeOld)
-    clear(&state.world.activeOld)
-    clear(&state.world.cellChanges)
+    deleteWorld()
 
     // for now just remake
-    cellCount := (state.worldWidth / cellSize) * (state.worldHeight / cellSize)
-
-    f := make([]CellState, cellCount)
-    b := make([]CellState, cellCount)
-
-    state.world.cellsNew = f
-    state.world.cellsOld = b
-    state.world.aliveCellCount = 0
+    init(1280, 720, cellSize, 30)
 }
 
 editCell :: proc(cell: Vec2i, to: CellState)
@@ -116,10 +122,8 @@ editCell :: proc(cell: Vec2i, to: CellState)
         switch to
         {
         case .alive:
-            state.world.aliveCellCount += 1
             state.world.aliveCells[cellIdx] = {}
         case .dead:
-            state.world.aliveCellCount -= 1
             delete_key(&state.world.aliveCells, cellIdx)
         }
 
@@ -172,8 +176,6 @@ simulateCell :: proc(
             return .alive
         }
         // dies
-        state.world.aliveCellCount -= 1
-
         delete_key(&state.world.aliveCells, cellIndex)
 
         return .dead
@@ -183,8 +185,6 @@ simulateCell :: proc(
         if neighbours == 3
         {
             // reproduces
-            state.world.aliveCellCount += 1
-
             state.world.aliveCells[cellIndex] = {}
 
             return .alive
@@ -203,7 +203,6 @@ updateSim :: proc()
     world.activeNew, world.activeOld = world.activeOld, world.activeNew
 
     // apply changes made by user
-    //TODO: deletions are not working correctly
     for key, value in world.cellChanges
     {
         // mark as active last frame
@@ -236,7 +235,7 @@ updateSim :: proc()
         neighbours: int
         for d in DirectionVectors
         {
-            if isInside(currentCell) &&
+            if isInside(currentCell + d) &&
                world.cellsOld[cellToIdx(currentCell + d)] == .alive
             {
                 neighbours += 1
@@ -263,14 +262,42 @@ updateSim :: proc()
     }
 }
 
-// returns false if closed by the user
-showSettingsPanel :: proc(guiState: ^GuiState) -> bool
+uiValueBox :: proc(
+    rect: rl.Rectangle,
+    displayVal: ^i32,
+    editVal: ^int,
+    min, max: i32,
+    editMode: ^bool,
+    callback: proc(newVal: int) = {},
+)
 {
-    menuWidth := f32(guiState.windowWidth) / 2
-    menuHeight := f32(guiState.windowHeight) / 2
+    result := rl.GuiValueBox(rect, "", displayVal, min, max, editMode^)
 
-    menuOriginX := f32(guiState.windowWidth) / 2 - (menuWidth / 2)
-    menuOriginY := f32(guiState.windowHeight) / 2 - (menuHeight / 2)
+    if result == 1
+    {
+        editMode^ = !editMode^
+
+        if editMode^ == false
+        {
+            newVal := int(clamp(displayVal^, min, max))
+            editVal^ = newVal
+
+            if callback != nil
+            {
+                callback(newVal)
+            }
+        }
+    }
+}
+
+// returns false if closed by the user
+showSettingsPanel :: proc(windowWidth, windowHeight: int) -> bool
+{
+    menuWidth := f32(windowWidth) / 2
+    menuHeight := f32(windowHeight) / 2
+
+    menuOriginX := f32(windowWidth) / 2 - (menuWidth / 2)
+    menuOriginY := f32(windowHeight) / 2 - (menuHeight / 2)
 
     rowCount := f32(10)
     row := menuHeight / rowCount
@@ -291,13 +318,17 @@ showSettingsPanel :: proc(guiState: ^GuiState) -> bool
         {menuOriginX, menuOriginY + row * 1, menuWidth, row},
         strings.clone_to_cstring(ssLabel, context.temp_allocator),
     )
-    rl.GuiSpinner(
+
+    @(static) simSpeedVal := i32(30)
+    @(static) simSpeedMode: bool
+
+    uiValueBox(
         {menuOriginX, menuOriginY + row * 2, menuWidth, row},
-        "",
-        &guiState.simSpeed,
+        &simSpeedVal,
+        &state.simulationSpeed,
         0,
         60,
-        false,
+        &simSpeedMode,
     )
 
     csLabel := fmt.aprintf(
@@ -310,42 +341,30 @@ showSettingsPanel :: proc(guiState: ^GuiState) -> bool
         {menuOriginX, menuOriginY + row * 3, menuWidth, row},
         strings.clone_to_cstring(csLabel, context.temp_allocator),
     )
-    rl.GuiSpinner(
+
+    @(static) cellSizeVal := i32(30)
+    @(static) cellSizeMode: bool
+
+    uiValueBox(
         {menuOriginX, menuOriginY + row * 4, menuWidth, row},
-        "",
-        &guiState.cellSize,
-        1,
+        &cellSizeVal,
+        &state.cellSize,
+        0,
         20,
-        false,
+        &cellSizeMode,
+        resizeWorld,
     )
 
     rl.GuiCheckBox(
         {menuOriginX, menuOriginY + row * 5, row, row},
         "Show active region",
-        &guiState.showActiveCells,
+        &state.showActiveCells,
     )
     rl.GuiCheckBox(
         {menuOriginX, menuOriginY + row * 6, row, row},
         "Show camera debug",
-        &guiState.showCameraDebug,
+        &state.showCameraDebug,
     )
-
-    if (rl.GuiButton(
-               {menuOriginX, menuOriginY + row * rowCount, menuWidth, row},
-               "Apply",
-           ))
-    {
-        // apply changes
-        state.simulationSpeed = int(guiState.simSpeed)
-        state.cellSize = int(guiState.cellSize)
-        state.showActiveCells = guiState.showActiveCells
-        state.showCameraDebug = guiState.showCameraDebug
-
-        resizeWorld(int(guiState.cellSize))
-
-        // close the menu once done
-        return false
-    }
 
     return true
 }
@@ -371,6 +390,31 @@ clampCamera :: proc(worldDimensions: Vec2f, camera: ^rl.Camera2D)
 
 main :: proc()
 {
+    when ODIN_DEBUG
+    {
+        track: mem.Tracking_Allocator
+        mem.tracking_allocator_init(&track, context.allocator)
+        context.allocator = mem.tracking_allocator(&track)
+
+        defer
+
+
+
+        {
+            if len(track.allocation_map) > 0
+            {
+                for _, entry in track.allocation_map
+                {
+                    fmt.eprintf(
+                        "%v leaked %v bytes\n",
+                        entry.location,
+                        entry.size,
+                    )
+                }
+            }
+            mem.tracking_allocator_destroy(&track)
+        }
+    }
 
     WINDOW_WIDTH :: 1280
     WINDOW_HEIGHT :: 720
@@ -381,19 +425,8 @@ main :: proc()
 
     // init state
     init(WINDOW_WIDTH, WINDOW_HEIGHT, DEFAULT_CELL_SIZE, DEFAULT_SIM_SPEED)
+    defer deleteWorld()
 
-    // TODO: clean this up?
-
-    // copy current state
-    guiState := GuiState {
-        WINDOW_WIDTH,
-        WINDOW_HEIGHT,
-        i32(state.simulationSpeed),
-        i32(state.cellSize),
-        state.showActiveCells,
-        state.showCameraDebug,
-        &state.world,
-    }
 
     generation: int
 
@@ -494,17 +527,8 @@ main :: proc()
 
             if rl.IsKeyPressed(.R)
             {
-                // TODO: fix this
-
-                // reset world
-                slice.zero(state.world.cellsOld)
-                slice.zero(state.world.cellsNew)
-                clear(&state.world.activeNew)
-                clear(&state.world.activeOld)
-                state.world.aliveCellCount = 0
-                clear(&state.world.cellChanges)
-                clear(&state.world.aliveCells)
                 generation = 0
+                clearWorld()
             }
 
             // step simulation 1 at a time
@@ -590,7 +614,7 @@ main :: proc()
             strings.clone_to_cstring(
                 fmt.aprintf(
                     "Alive Cells: %v\nGeneration: %v\nFPS: %v",
-                    state.world.aliveCellCount,
+                    len(state.world.aliveCells),
                     generation,
                     fps,
                     allocator = context.temp_allocator,
@@ -606,7 +630,7 @@ main :: proc()
 
         if showSettings
         {
-            open := showSettingsPanel(&guiState)
+            open := showSettingsPanel(WINDOW_WIDTH, WINDOW_HEIGHT)
 
             if !open
             {
